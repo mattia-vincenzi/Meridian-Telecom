@@ -1,206 +1,200 @@
 # Meridian Telecom - Solution
 
-## 1. Requirements and constraints
+## 1. Design drivers and assumptions
 
-- **Explicit requirements:** a resumable customer journey lasting days or weeks, durable conversations and pending actions, including manual review; no duplicate charges or SIM shipments, and no activation before required checks pass. Chatbot responsiveness must not depend on completion of background work.
-- **Explicit reliability and security targets:** 99.9% availability; conversation and durable workflow state RPO < 1 minute and RTO < 10 minutes; confidential customer data stays in the selected region; agent runs and external actions are traceable and auditable.
-- **Constraints:** AWS, managed Kubernetes for first production, public internet exposure, two Platform Engineers alongside AI Engineers. Prefer managed services where their benefit justifies lock-in; infrastructure costs must be measurable and sustainable.
-- **Workload context:** around 100 launch users, growing toward 100,000 users, thousands of concurrent sessions and hundreds of thousands of daily background tasks. Mostly I/O-bound, with some CPU-heavy processing; company-managed GPUs are optional. Identity verification, payment, fulfilment and provisioning already exist as integrations.
+### Requirements and constraints
 
-## 2. Assumptions and open questions
+- **Customer journey:** conversations and progress survive disconnections, restarts and deployments, including waits lasting weeks and manual review. Customers receive timely responses and updates; retries must not cause duplicate charges or shipments, or activation before required checks pass.
+- **Reliability and security:** 99.9% availability; conversation and durable workflow state RPO < 1 minute and RTO < 10 minutes; confidential data remains in the selected region; agent runs and external actions are auditable.
+- **Platform:** AWS and managed Kubernetes, operated by two Platform Engineers alongside AI Engineers. Use managed services where their operational benefit justifies lock-in; make infrastructure costs measurable.
+- **Scale:** approximately 100 launch users, with a path to 100,000 users, thousands of concurrent sessions and hundreds of thousands of daily background tasks. Mostly I/O-bound work, some CPU-heavy processing, optional company-managed GPUs and existing external integrations.
 
-### Assumptions
+### Working assumptions and confirmations
 
-- AWS accounts and provider sandboxes are available; platform infrastructure must be built.
-- Recovery targets are assumed to cover pod/node failures, primary database failure and loss of one availability zone in the selected region. Meridian must confirm this scope; logical corruption and regional outages are not demonstrated to meet the targets. Cross-region recovery cannot bypass residency.
-- Use a monthly window as the working assumption for 99.9%; Meridian must agree the scope, success criteria and latency thresholds. Measure customer experience end to end, including provider impact.
-- Customers may explore offers anonymously but authenticate before accessing a personal journey. This is a product assumption, not an assignment requirement.
-- Growth is assumed to be gradual, with temporary bursts. Start with a resilient baseline, not capacity for 100,000 users; size from concurrency, operation frequency and duration. Compliant external model endpoints are assumed available for launch without dedicated GPUs.
+| Topic | Working position | Confirmation needed |
+|---|---|---|
+| Recovery and availability | Design for pod/node, primary database and single-AZ failures; measure availability monthly. | Agree success/latency criteria and failure scope. Logical corruption and regional outages are not demonstrated to meet the recovery targets. |
+| Residency and providers | Launch with approved regional model endpoints and no dedicated GPUs. | Select region and confirm residency across integrations, inference, telemetry, backups and provider access. Verify idempotency and its retention window, status lookup, callback authentication and correlation contracts. |
+| Product and operations | Authenticate before accessing a personal journey; use essential notifications and manual exception handling. | Select IdP and notification channel; agree retention/deletion, reviewer ownership, response times and on-call coverage. |
+| Delivery and capacity | Accounts and sandboxes are available; growth is gradual with bursts; AI development proceeds alongside Platform. | Confirm team availability, traffic shape, job duration, model mix, latency expectations and budget. |
 
-### Open questions
+These assumptions do not relax the requirements. Missing provider guarantees can prevent safe automation; unresolved residency or recovery requirements block launch.
 
-These are confirmations and inputs needed to validate the design; the assignment's reliability, correctness and residency targets remain requirements.
-
-- **Recovery scope:** do RPO < 1 minute and RTO < 10 minutes also cover logical corruption and regional outages? Confirm the assumed failure scope and end-to-end recovery acceptance criteria; backup restoration alone has not been shown to meet the targets.
-- **Availability:** agree the scope, measurement window, success criteria and latency thresholds for 99.9%, including how provider impact is reported. Confirm operational coverage and escalation compatible with this objective.
-- **Regional residency:** which region, provider endpoints and contracts satisfy residency, including inference, logs, backups, support access and subprocessors? A non-compliant dependency blocks launch.
-- **External-action correctness:** do providers support stable idempotency keys, sufficiently long deduplication windows, status lookup and authenticated callbacks? Confirm these contracts before relying on safe automated retries of payments or shipments.
-- **Manual review and support:** who owns customer exceptions, with what response times, permissions and escalation? Two Platform Engineers do not imply continuous on-call coverage or business-review ownership.
-- **Scale and sustainable costs:** what traffic shape, concurrency, job duration, model mix, file volumes, latency targets and budget should drive sizing and cost estimates? Validate capacity and unit costs on representative workloads before expanding.
-- **Product and retention choices:** which IdP handles customer/operator authentication, independently of identity verification? Which notification channel/provider and contact preferences apply? Which documents/audio should be retained, for how long, and what audit retention/deletion obligations apply?
-
-## 3. Proposed architecture
-
-### High-level design
-
-The design decisions below were reviewed with the user. Assumptions and external confirmations remain explicit in section 2.
+## 2. Architecture and key decisions
 
 ```mermaid
 flowchart LR
-    C[Customer] --> I[Protected public ingress: TLS / WAF / ALB]
+    C[Customer] --> I[Public ingress: TLS / WAF / ALB]
     I --> A[EKS chatbot and application API]
-    A <--> D[(RDS PostgreSQL Multi-AZ: data / outbox)]
+    A <--> D[(RDS PostgreSQL Multi-AZ: application data / outbox)]
     D <--> R[EKS outbox dispatcher]
     R -->|start / callback| F[Step Functions Standard: durable journey]
-    R --> Q[SQS: background jobs]
-    R --> N[Essential notifications: link to private area]
-    F --> Q
-    Q --> W[EKS workers and integration adapters]
+    R -->|independent jobs| Q[SQS]
+    R --> N[Essential notifications]
+    F -->|journey tasks| Q
+    Q --> W[EKS workers: processing / integrations / reconciliation]
     W <--> D
-    W --> P[Existing identity verification / payment / fulfilment / provisioning]
+    W --> P[Identity / payment / fulfilment / provisioning providers]
     P -->|authenticated events| I
-    A <--> O[(Regional S3: retained documents / audio)]
+    A <--> O[(Regional S3: documents / audio)]
     W <--> O
     A --> M[Approved regional model endpoints]
 ```
 
-The API commits conversation updates, accepted commands and pending dispatch together before returning a durable reference and pending status. The outbox dispatcher starts the journey or submits an independent job; workflow-owned jobs are submitted by Step Functions, not duplicated by the API. User inputs and authenticated provider events are durably correlated to the waiting journey. The chatbot reads a persisted summary with pending actions and freshness, without rebuilding execution history on every request.
+### Network view
 
-### Main components and responsibilities
+```mermaid
+flowchart LR
+    U[Internet] --> E[WAF and public ALB<br/>public subnets]
+    E --> K[Ingress, API and workers<br/>private EKS nodes across two AZs]
+    K --> D[(Private RDS PostgreSQL<br/>Multi-AZ)]
+    K --> V[S3 gateway endpoint]
+    V --> S[(Regional private S3 buckets)]
+    K --> N[Controlled NAT egress<br/>one gateway per AZ]
+    N --> P[External AI and business providers]
+    P -->|authenticated callbacks| E
+```
 
-- **Step Functions Standard** owns workflow execution, timers, waits and transitions. Only work that gates the journey requires a callback; independent document/audio processing can complete as an ordinary queued job.
-- **EKS** runs the application, outbox dispatcher and separately scalable workers. SQS absorbs bursts; it is not the store for weeks-long business waits. Messages carry references rather than confidential payloads where possible.
-- **RDS PostgreSQL Multi-AZ** stores conversations, application data, operation identities/results and the queryable journey summary. The summary may lag and must be repairable from execution and operation records. It is not a second workflow engine and cannot authorize an external action on its own.
-- **Regional S3** stores retained documents/audio; PostgreSQL holds ownership, metadata and journey references. Authorize short-lived presigned transfers, validate uploads before processing, and pin the validated object version to prevent later replacement. Finalize metadata and any processing command/outbox entry atomically in PostgreSQL; clean abandoned uploads and orphan objects. Keep buckets private, encrypted and regional, with versioning and lifecycle rules covering old versions and deletion obligations. Workflow inputs/history carry minimal references rather than full documents or conversations. S3 avoids inflating database backups; database blobs offer atomic storage, while a shared filesystem is justified only by filesystem-dependent tools. Revisit storage only for such concrete needs. [S3 presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html), [S3 versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)
-- **Customer updates** combine authenticated status/history with essential notifications for required intervention and agreed milestones. Use the outbox, minimal content and a link to the private area; no document links or sensitive detail in notifications. Recheck whether reminders are still relevant. Chat-only updates miss absent customers; every-transition messages create noise. Delivery failure does not undo journey progress, and provider acceptance does not prove the customer read the message.
-- **Existing providers** determine external outcomes; local timeouts cannot establish failure. Reconcile authoritative evidence before advancing.
+The launch VPC spans two Availability Zones. Only the ALB and NAT gateways use public subnets; EKS nodes and RDS have no public addresses. Security groups restrict the ALB-to-application and application-to-database paths. An S3 gateway endpoint keeps object traffic off the NAT path without an hourly endpoint charge. NAT provides zonal outbound connectivity rather than destination filtering, so workload identity, application allow-lists and provider controls remain necessary. Each AZ uses its local NAT path so the loss of one AZ does not remove provider connectivity. [S3 gateway endpoints](https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html), [NAT gateway pricing and topology](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-pricing.html)
 
-### Platform vs AI ownership boundary
+### Components and responsibilities
 
-Platform owns infrastructure, IAM/networking, delivery foundations, recovery tooling, telemetry, capacity and infrastructure cost. AI Engineers own conversational behaviour, workflow definitions, integration/business logic, deterministic action checks, model selection and model cost. Both teams agree operation/idempotency contracts, compatibility and incident handoffs, and validate the first journey end to end. Business ownership of manual review remains unresolved; it must not default silently to Platform.
+The API persists conversation turns and accepted commands before confirming receipt. A transactional outbox records pending dispatch with the corresponding application change. A small replicated polling dispatcher delivers starts, callbacks, independent jobs and notifications. This adds delivery latency and recovery logic, but prevents accepted work being lost between a database commit and a remote call. [Transactional outbox](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html)
 
-## 4. Key design decisions and trade-offs
+Step Functions submits journey tasks to SQS; the API does not also submit those tasks. Workers handle integrations and CPU-heavy processing independently of interactive traffic. Business waits live in the workflow, without occupying a worker or leaving a queue message unacknowledged for days. Only tasks that gate progress need workflow callbacks. [Callback integrations](https://docs.aws.amazon.com/step-functions/latest/dg/connect-to-resource.html)
 
-| Decision | Problem and selected option | Credible alternative | Cost / trade-off and revisit trigger |
+The chatbot reads persisted status and pending actions. Distinguish a received message from a completed model response, and recover interrupted turns. Status access remains available without inference; a pending acknowledgement does not count as a completed conversational answer. Notify absent customers of required action and agreed milestones through minimal messages linking to the private area.
+
+S3 holds retained documents/audio; PostgreSQL holds ownership and metadata. Use private encrypted storage, authorized short-lived transfers, upload validation and a fixed validated object version. Apply retention and cleanup to abandoned uploads and old versions. Queues and workflow payloads carry references rather than customer content.
+
+### Four choices to defend
+
+| Choice | Why this option | Alternative and trade-off | Revisit when |
 |---|---|---|---|
-| Durable orchestration | Step Functions Standard handles waits and resumptions without keeping a pod alive. | A custom PostgreSQL workflow is initially familiar but adds timers, recovery and tooling to maintain. Temporal is credible where workflow programming requirements justify another platform dependency. | AWS-specific definitions, service quotas, transition charges and application compatibility remain. Revisit if measured cost, workflow expressiveness or portability needs outweigh managed-service benefits; no planned Temporal migration. |
-| Separate jobs from orchestration | SQS and EKS workers isolate CPU-heavy/high-volume jobs from interactive requests; callbacks only for journey dependencies. | Execute everything as workflow tasks, or let queue consumers coordinate the entire journey. | Queue redelivery, backpressure and callback recovery add work, but avoid per-job orchestration where unnecessary. Revisit queue boundaries based on contention and priority, not predicted final scale. |
-| PostgreSQL plus persisted summary | One transactional application store supports resumption, operation deduplication and efficient status reads; no Redis at launch. | Read workflow history per request, or add a separate cache/read store. | Summary freshness and database capacity need monitoring; Multi-AZ has a minimum cost. Revisit caching only after query/index/connection tuning and measured read pressure. |
-| Terraform with S3 remote state | Reproducible changes and shared, locked state support two Platform Engineers. | A managed Terraform execution platform; local state is unsuitable for shared operations. | Platform maintains CI, recovery and provider upgrades. Revisit managed execution if governance or pipeline maintenance warrants it. Ansible only for an actual host-management need. |
+| Step Functions Standard | Managed durable waits, timers and resumptions. | A PostgreSQL workflow adds recovery/timer tooling to maintain; Temporal is credible for stronger workflow programming needs. Step Functions adds AWS-specific definitions and transition costs. | Expressiveness, portability or measured costs outweigh the managed-service benefit. |
+| PostgreSQL with outbox and status summary | One transactional application store supports resumption, operation records and efficient reads. | Reading execution history per request couples customer access to orchestration APIs; another read store adds synchronization. The summary can lag and needs repair. | Query/index/connection tuning no longer resolves measured database pressure. |
+| SQS and EKS workers | Buffer bursts and scale background work separately from chat. | Doing work inside requests ties responsiveness to provider latency; orchestration for every independent job adds unnecessary coordination. Queues require duplicate handling and backpressure. | Measured contention or priority differences justify separating worker pools or queues. |
+| Managed services and resilient baseline | EKS, RDS Multi-AZ and managed telemetry reduce operations for a small team. | Self-hosting offers control but adds maintenance; Single-AZ lowers cost but weakens the recovery approach. The chosen baseline has a material minimum cost and AWS dependency. | Measured economics or operational requirements justify a different arrangement. |
 
-Standard supports long-running workflows and callback integrations; its workflow execution semantics do not guarantee exactly-once effects in external systems. Cost comparisons require actual transition and task volumes. [AWS workflow types](https://docs.aws.amazon.com/step-functions/latest/dg/choosing-workflow-type.html)
+Standard workflow execution does not by itself guarantee exactly-once effects at a payment or shipment provider. Application and provider contracts remain necessary. [Workflow types](https://docs.aws.amazon.com/step-functions/latest/dg/choosing-workflow-type.html)
 
-Use a dedicated regional, private, encrypted S3 state bucket, separate from customer files, with versioning and native `use_lockfile = true`; pin a compatible Terraform version. Separate environment states and permissions, bootstrap the backend independently, and restrict access to Platform/CI temporary roles. Review plans in pull requests and serialize ordinary CI applies per state; locking also protects against concurrent clients. DynamoDB locking is deprecated. Recover old state only after reconciling real resources: restoring state does not roll back infrastructure. Verify a run has ended before clearing a stale lock; monitor console drift. [Terraform S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3)
+### Three application contracts
 
-## 5. Reliability, security and operability
+1. **State ownership:** Step Functions owns execution position, waits and transitions. PostgreSQL owns conversations, business facts and operation records; providers supply authoritative evidence of external effects. The summary is a derived view, never authorization for an action. Persist enough business history to reconstruct customer status independently of workflow-history retention; use execution state to reconcile orchestration progress.
+2. **Operation identity:** repeated requests for the same purchase reuse the same intended payment or shipment, even across sessions. Atomically check prerequisites and authorize an operation with fixed input/version before external submission. Changes after submission require an explicit correction or assistance path. Deterministic application checks enforce eligibility and customer confirmation; neither the model nor a duplicate message can authorize activation.
+3. **Recovery:** durably capture and deduplicate incoming events before acknowledging them, including events arriving before their wait registration. Reconciliation matches evidence to operations and eligible waits, repairs summaries and schedules callbacks; late or duplicate events cannot regress confirmed progress. An unknown outcome remains pending until resolved; unresolved uncertainty goes to manual review, without a new charge or shipment.
 
-### Reliability
+Platform owns infrastructure, IAM/networking, delivery, recovery tooling, telemetry, capacity and infrastructure spend. AI Engineers own conversation, workflow and integration logic, including reconciliation running in the existing workers; Platform provides its scheduled execution and monitoring. Both agree operation contracts, compatibility and incident handoffs. Business reviewers own customer exceptions; that role must be assigned before launch.
 
-- **Safe actions:** assign stable journey, command and business-operation IDs. Unique constraints and atomic job claims with expiring leases prevent ordinary concurrent execution; a lease alone cannot prevent a stale worker affecting a provider. Reuse the provider idempotency key for the same intended action, persist results, and acknowledge jobs only after durable handling. Redelivery must return the prior result or reconcile pending work. [SQS delivery semantics](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues-at-least-once-delivery.html)
-- **Uncertain outcomes:** a payment/shipment timeout means unknown, not failed. Use status lookup and authenticated callbacks to reconcile; do not blindly retry with a new key. If provider evidence cannot resolve uncertainty safely, hold the journey for manual resolution. Deduplication retention must cover the actual retry/recovery horizon.
-- **Business correctness:** deterministic server-side checks verify identity, payment and the other agreed prerequisites immediately before critical actions. The model cannot authorize activation. Duplicate, late and out-of-order events must not regress confirmed state or bypass checks; corrected details do not silently repeat an already submitted action.
-- **Dependency failures:** bounded timeouts, backoff with jitter, retry budgets and circuit breakers prevent retry storms. Respect provider quotas; use queue concurrency limits, dead-letter queues and reviewed replay. Show truthful pending status while affected work pauses.
-- **Callback recovery:** commit the result and pending callback together before acknowledging SQS; the same dispatcher delivers it. Retry notification, not the completed action. Keep operation identity stable and execution/attempt/token distinct. An invalid token alone does not prove delivery: reconcile execution state; a new waiting attempt can receive the saved result through its new token only if it still refers to that operation. Closed or diverted journeys are not forced forward. Protect tokens and set bounded waits. [AWS callback pattern](https://docs.aws.amazon.com/step-functions/latest/dg/connect-to-resource.html)
-- **Transactional outbox — agreed:** atomically record each accepted command and pending dispatch. A separate EKS Deployment starts with two lightweight polling replicas: acquire due batches atomically with row locks/`SKIP LOCKED`, record an expiring lease, commit, then call AWS outside the transaction. Updates verify lease ownership; expired claims are recoverable. Stable IDs, immutable dispatch input and reconciliation handle ambiguous sends. Use bounded retries/backoff, retain blocked sends for intervention and monitor oldest pending age. Polling adds DB reads and dispatch latency; prefer it over CDC at launch, revisiting on measured load/latency. It delivers work, not business transitions. [AWS outbox](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html), [PostgreSQL locking](https://www.postgresql.org/docs/current/sql-select.html)
-- **Workflow versioning — agreed:** persist the exact workflow version in the outbox. Apply additive schema changes, deploy workers supporting old and new job contracts, then enable the new workflow for new journeys. Retain compatibility through pending jobs, old journeys and the agreed replay horizon; separate worker versions only for unavoidable incompatibility. Drain on shutdown and recover interrupted work. Routing new starts back does not undo executions already started on the new version; rollback must still support them. [AWS workflow versions](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-state-machine-version.html)
-- **Recovery:** distribute replicas and capacity across zones, use RDS Multi-AZ, automatic client reconnection and controlled deployments. Measure state loss and time until conversations/status and pending work are usable again, including workflow/DB reconciliation, against RPO < 1 minute and RTO < 10 minutes. Multi-AZ costs more than Single-AZ but avoids relying on restore for ordinary failures. Keep regional backups and rehearse restores separately; PITR alone does not establish these targets. Logical corruption and regional outages remain outside the demonstrated scope, subject to Meridian confirmation. [RDS failover](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html), [RDS restore](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_PIT.html)
+## 3. Worked example: a payment survives a crash
 
-For Standard workflow starts, reuse the command-derived execution name and identical input. `StartExecution` is idempotent for matching running executions; a closed execution returns `ExecutionAlreadyExists` and requires reconciliation, not a new name. Name protection is time-limited, so old replays also require application records. SQS sends and deliveries may duplicate: consumers must deduplicate operations. See [StartExecution semantics](https://docs.aws.amazon.com/step-functions/latest/apireference/API_StartExecution.html) and the detailed scenarios in [questions.md](questions.md).
+This illustrative purchase journey assumes identity verification has passed. The payment provider supports stable idempotency keys, authoritative lookup and authenticated events carrying our operation reference. These capabilities must be confirmed; this is a design walkthrough, not a test result.
 
-### Security
+| Event | Responsible component and durable handling | Customer-visible result |
+|---|---|---|
+| 1. Customer confirms the purchase. | API saves confirmation, the purchase/payment identity and pending workflow start together. A repeated confirmation resolves to the same purchase. | Request accepted, processing pending. |
+| 2. Payment is dispatched. | Dispatcher starts the pinned workflow version using a stable execution identity. Step Functions queues the task and waits. Worker checks prerequisites and persists the authorized payment intent and fixed input before calling the provider with its stable key. | Payment processing. |
+| 3. Provider charges successfully; worker crashes. | The crash occurs before the worker saves the result and completes local wait registration. The operation intent survives; the queue task remains recoverable. Local state cannot yet claim success or failure. | Payment confirmation pending, not a request to pay again. |
+| 4. Webhook arrives before local recovery. | API authenticates and durably stores the event against the operation reference before acknowledging it. The event survives even though its workflow wait association is incomplete. | Existing pending status remains safe until the evidence is applied. |
+| 5. Customer returns in another session. | API reads the same conversation, purchase and persisted status. Repeated confirmation does not create another payment operation. | The journey resumes; the customer sees current pending actions and status freshness. |
+| 6. Recovery joins the evidence and the wait. | Redelivery lets the worker restore the task association and reconcile the stored event or provider lookup, without a new payment. It commits the confirmed outcome, summary and pending callback together before acknowledging the queue task. | Payment confirmed; fulfilment pending. |
+| 7. The workflow continues. | Dispatcher delivers the callback. If delivery is uncertain, reconcile execution state and retry the callback, not payment. Use only an eligible wait for the same operation. Fulfilment uses its own stable operation identity; delivery and provisioning outcomes are persisted and activation checks remain enforced. | Milestone updates through delivery and activation; required actions remain accessible on return. |
 
-Seven agreed principles apply from launch:
+A task token identifies a particular wait attempt, not the commercial operation. An expired token cannot establish whether progress occurred; a closed or diverted journey must not be forced forward. If evidence cannot resolve payment safely, suspend for an authorized reviewer. If a later step fails after a charge or shipment, handle any refund or cancellation manually at launch, record the outcome and communicate it. This avoids building a generic compensation engine, at the cost of reviewer effort and slower exceptional resolution.
 
-1. **Customer isolation:** enforce authenticated customer ownership on every conversation, journey, file and action; never trust an ID or model-provided customer identity as authorization. Carry verified ownership into asynchronous work. Shared services with centralized application authorization are the launch default; database-per-customer is disproportionate. RLS is an optional additional defence, not a substitute for API/file/action checks; revisit if query-access risks justify its role and connection-context complexity.
-2. **Identity Provider:** delegate authentication to the selected IdP; require appropriate operator roles and strong authentication. Authenticate and deduplicate provider events independently.
-3. **Workload identity:** give each workload narrowly scoped AWS permissions through workload roles, without shared static credentials. Separate application, worker, dispatcher, deployment and operator rights; EKS Pod Identity is a suitable mechanism.
-4. **Secrets store:** use a managed regional secrets store, rotation and restricted access. Encrypt traffic and stored data, including backups; redact secrets, tokens and personal content from telemetry.
-5. **Protected ingress:** TLS, WAF, request limits, validation and per-customer throttling protect public endpoints. Bound uploads and model/tool usage to control abuse and spend.
-6. **Deterministic critical-action controls:** validate tool arguments, eligibility, authorization and required customer confirmation outside the model. Treat prompts, uploads and provider content as untrusted; preserve evidence of approvals.
-7. **Private networking:** keep database and worker nodes private, restrict east-west traffic and control outbound destinations. Apply regional residency to storage, inference, telemetry, workflow payloads and external integrations. No fallback to unapproved destinations, even during an outage.
+## 4. Reliability, security and operation
 
-### Operability and observability
+### Reliability and recovery
 
-Use a managed regional telemetry backend (for example CloudWatch and AWS tracing), structured redacted logs, metrics and OpenTelemetry instrumentation. This reduces maintenance compared with a self-hosted stack; monitor ingestion/retention costs and revisit if cost or query needs justify another backend. Correlate short traces with journey, operation, execution and attempt IDs; link traces across waits instead of keeping one open for weeks. [OpenTelemetry traces](https://opentelemetry.io/docs/concepts/signals/traces/)
+Retries have separate responsibilities: the dispatcher retries delivery, workers make bounded transient call retries, and workflows control business waits and escalation. Reconcile ambiguous starts against the original execution before starting anything new. Preserve operation identity throughout, reconcile uncertain effects, and retain deduplication records through the recovery horizon. Backoff, provider-wide concurrency limits and reviewed dead-letter replay prevent retry storms. Reserve dispatch capacity for critical callbacks so notification failures cannot block progress.
 
-Keep a separate, unsampled durable application audit in PostgreSQL: agent runs, model/version, action requests, authorization, provider references, outcomes and operator interventions. Record local audit events with the corresponding transaction and external intentions/outcomes around provider calls, reconciling crash gaps. Ordinary application roles cannot update/delete audit records. Retention, controlled deletion and any immutable archive requirement remain open; this is not a claim of tamper-proof storage.
+Distribute application replicas and node capacity across zones, use RDS Multi-AZ and automatic client reconnection. Keep enough existing capacity in the surviving zones for chat and status at the agreed baseline load; background throughput may temporarily fall while nodes recover. Validate outbound provider connectivity under AZ loss as well as compute placement. This headroom costs more than relying entirely on replacement nodes. [RDS failover](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html)
 
-Measure 99.9% end to end over the proposed monthly window, with agreed success/latency criteria for chat, durable acceptance and status access. A `200` alone is insufficient. Report provider impact and asynchronous progress separately without hiding stalled processing behind a healthy chat endpoint; a legitimate business wait is not itself downtime.
+Measure state loss and time until conversations, status and pending work are usable against RPO < 1 minute and RTO < 10 minutes. Regional backups and restore drills address separate recovery needs; Multi-AZ and backups alone do not prove these targets. Logical corruption and regional outages remain outside the assumed scope, pending confirmation; recovery cannot bypass residency.
 
-Dashboards cover latency/errors, blocked journey age, unknown external outcomes, queue age/dead letters, outbox/callback backlog, provider throttling, DB saturation and costs. Alerts need an owner and actionable runbook. An authenticated operator view shows reason, evidence, next action and assigned reviewer; interventions use authorized application actions and audit, not routine direct DB edits. Platform handles infrastructure, AI workflow/integration defects, business reviewers customer exceptions. Coverage, escalation and response times must support the SLO; two engineers do not imply continuous on-call.
+Pin workflow versions for accepted starts. Deploy additive schemas and compatible workers before enabling new workflows; maintain compatibility for open journeys and pending replays. Rolling back new starts does not undo executions already running the new version.
 
-## 6. Scaling and cost
+### Security and audit
 
-### Launch
+- **Access:** selected IdP for customer/operator authentication, strong operator authentication and explicit roles. Enforce ownership on every conversation, file and action, including asynchronous work. Authenticate provider events independently.
+- **Exposure and secrets:** TLS, WAF, request/upload limits and customer throttling; private database and worker nodes, restricted internal traffic and controlled egress. Use scoped workload roles and a regional secrets store, with rotation and encryption.
+- **AI and residency:** treat prompts, uploads and external content as untrusted. Validate tool arguments and approvals outside the model. Bound model/tool usage and permit only approved regional destinations, including telemetry and backups; degrade safely if none is available.
+- **Audit:** retain unsampled application records of agent runs/model versions, approvals, operation intentions, provider outcomes and operator interventions. Write local audit with the related transaction, reconcile external-call gaps and prevent ordinary application roles from modifying audit history. Redact personal content and tokens from telemetry; retention/deletion and any immutable archive obligation require agreement.
 
-Use a small EKS footprint with replicated interactive services, separately bounded workers, RDS Multi-AZ, SQS and Step Functions. This has a non-trivial minimum cost for 100 users, justified by the Kubernetes constraint and reliability target. Keep chatbot calls I/O-oriented, persist each turn and offload heavy processing. Agree latency objectives, limit external concurrency and return pending status when dependencies are slow.
+### Daily operation
 
-### Growth
+Use regional managed telemetry with structured logs, metrics and OpenTelemetry tracing. Correlate journey and operation IDs across short traces; retain audit independently of trace sampling. Managed telemetry reduces maintenance but requires ingestion and retention controls.
 
-Use separate HPAs: active requests per chatbot replica and SQS backlog per worker, calibrated against job duration and desired drain time; CPU where representative. Queue age remains an alert/progress signal. External state enables interchangeable replicas; idempotency still governs concurrency. Keep minimum interactive replicas across zones and conservative scale-down. Bound maximum replicas, aggregate provider calls and DB connections. Keep dispatcher replicas fixed initially. Expose external/custom metrics through an adapter or KEDA integration selected during implementation; EKS does not supply them automatically. VPA recommendations are optional for sizing, not a launch dependency. [Kubernetes HPA](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/)
+Measure availability through customer-visible chat, durable acceptance and status access, with agreed latency/success criteria and explicit provider impact. Track asynchronous progress separately: legitimate business waits are not downtime, but stalled processing must remain visible. Monitor latency/errors, unknown outcomes, queue/outbox age, provider throttling, database pressure and cost.
 
-Use Managed Node Groups with Cluster Autoscaler for node capacity. HPA alone leaves pods pending when nodes are full. Retain baseline headroom for interactive traffic and bounded node growth; queues absorb background provisioning delay. Karpenter offers more flexible provisioning but adds controller ownership; Auto Mode reduces operations with added fees/constraints and is not selected. Revisit if workload diversity or operating effort warrants it. [AWS Cluster Autoscaler](https://docs.aws.amazon.com/eks/latest/best-practices/cas.html), [AWS Auto Mode](https://docs.aws.amazon.com/eks/latest/best-practices/automode.html)
+An authenticated operator view exposes evidence, pending action and assigned reviewer. Interventions use audited application actions. Platform handles infrastructure incidents, AI Engineers workflow/integration defects, and business reviewers customer exceptions. Alerts require actionable runbooks and escalation; two Platform Engineers do not imply continuous coverage.
 
-Share nodes initially with measured resource requests/limits and bounded worker concurrency. When CPU jobs interfere with chat or require a different machine profile, add a compute-optimized group. A `NoSchedule` taint reserves it, worker tolerations permit entry, and labels plus required node affinity direct workers there. Tolerations alone do not select nodes. Isolation can leave spare capacity unused; extra cores only accelerate a single job if its implementation uses them. [Kubernetes scheduling](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+## 5. Growth and cost
 
-Load-test progressively toward thousands of concurrent sessions and hundreds of thousands of daily jobs using duration and burst profiles, not user count alone. Tune queries/indexes before caches/replicas and raise quotas before reaching limits. This preserves the architecture without pre-provisioning final-scale capacity.
+Start with a small resilient EKS footprint, bounded workers, RDS Multi-AZ and the managed queue/orchestrator. Share nodes initially with resource requests/limits that protect chat from CPU-heavy work. Keep the dispatcher small and replicated; avoid Redis and dedicated GPUs at launch.
 
-### Deferred complexity
+As demand grows, scale chat on active requests and workers on backlog relative to job duration and desired drain time. HPA needs a metrics adapter or KEDA for these signals. Managed Node Groups with Cluster Autoscaler supply node capacity; queues absorb background provisioning delays. Bound replicas, database connections and aggregate provider traffic: more workers cannot overcome a provider quota. Isolate CPU workloads when measured contention justifies extra capacity. Retain interactive headroom and conservative scale-down.
 
-Defer Redis, GPUs and Temporal until measurements or concrete requirements justify them. For GPUs, use a dedicated node group with taints/tolerations, required affinity, explicit GPU resources and compatible drivers/device plugin. Scale inference replicas on relevant demand and nodes on capacity needs; model loading and node startup may require warm capacity for interactive use. Self-hosting is not automatically cheaper. AI owns model suitability/quality and routing; Platform owns serving infrastructure, isolation, capacity and observability. [Kubernetes GPU scheduling](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)
+Validate progressively toward the stated concurrency and task volumes using representative durations and bursts; user count alone is insufficient. Tune database access before adding caches, and request quotas before reaching limits. Consider GPU serving only for a required model or measured benefit, including utilization, startup and operating cost. AI owns model suitability, routing and usage costs; Platform owns serving infrastructure and capacity. Revisit orchestration only for demonstrated limitations.
 
-Any model router must enforce approved regional destinations, quotas and cost limits. Confidentiality is required at launch; fail closed or degrade safely if no compliant endpoint is available. A hybrid provider/GPU setup is justified only by a specific model or measured need.
+Separate the **fixed baseline** (EKS, nodes, Multi-AZ database, ingress/networking and telemetry) from **variable usage** (compute, storage, transitions, queue requests, logs and traffic). Track model consumption separately and jointly report cost per completed journey, including retries and abandonment. Use environment/component attribution, budget alerts and enforceable usage/concurrency limits.
 
-### Main cost drivers
+**Indicative launch baseline: approximately €700–1,200 per month** for one production environment, excluding model and external-provider charges. This is a budgeting range rather than an AWS quote. It assumes eu-west-1, 730 hours per month, on-demand pricing without credits or commitments, a planning conversion of USD 1 ≈ EUR 1, modest launch traffic and no paid AWS support or tax.
 
-Separate the minimum platform floor (EKS, baseline nodes, Multi-AZ database, ingress/networking and telemetry) from variable worker compute, storage/retention, workflow transitions, queue requests, logs and network traffic. Track model tokens/calls and any GPU utilization separately. Platform owns infrastructure spend; AI owns model usage/cost; a shared view reports cost per completed journey and the effects of retries, abandonment and failed integrations. Use environment/component attribution, tags, budget alerts, retention limits and workload measurements; budget alerts do not replace concurrency controls. No numeric forecast or assertion that one engine is cheaper is defensible until region, usage and model assumptions are known.
+| Cost area | Launch assumption | Indicative monthly range |
+|---|---|---:|
+| EKS control plane | One cluster on a Kubernetes version in standard support. | €70–90 |
+| EKS nodes and disks | Two general-purpose nodes, each approximately 2 vCPU / 8 GiB, spread across two AZs, with small encrypted EBS volumes. Capacity must still be load-tested. | €160–250 |
+| RDS PostgreSQL | Multi-AZ deployment with one standby, approximately `db.m6g.large`, 50 GiB general-purpose storage and backups within the included allowance. | €250–400 |
+| Ingress and networking | One ALB, basic WAF rules, two zonal NAT gateways, public IPv4 addresses and modest processed data. | €120–180 |
+| Telemetry | Regional managed metrics/traces and approximately 10–30 GB of logs per month, 30-day operational retention and sampled tracing. | €30–100 |
+| Step Functions Standard | Illustrative 10,000–100,000 state transitions per month; free-tier eligibility is not assumed. | €0–5 |
+| Other managed services | Low launch usage of S3, SQS, ECR, secrets, encryption keys and backup storage. | €30–75 |
 
-## 7. Delivery and validation
+The row totals are approximately €660–1,100; the headline range rounds upward to allow for data transfer, request charges and estimation error. EKS and RDS create most of the minimum spend; Step Functions is immaterial at launch under the stated transition assumption. Actual pricing must be recalculated in the selected region before budget approval. [EKS pricing](https://aws.amazon.com/eks/pricing/), [RDS for PostgreSQL pricing](https://aws.amazon.com/rds/postgresql/pricing/), [Elastic Load Balancing pricing](https://aws.amazon.com/elasticloadbalancing/pricing/), [AWS WAF pricing](https://aws.amazon.com/waf/pricing/), [CloudWatch pricing](https://aws.amazon.com/cloudwatch/pricing/), [Step Functions pricing](https://aws.amazon.com/step-functions/pricing/)
 
-### Development and validation approach
+Variable cost depends on completed and abandoned journeys, steps and retries per journey, model calls and tokens, document/audio processing, retained data and telemetry, and outbound traffic. Track both infrastructure cost per completed journey and model-provider cost per journey: user count alone does not predict either. Replace these assumptions with measured workload scenarios before committing budget. A cheaper baseline must still be assessed against recovery capacity and operator effort.
 
-Use reviewed Terraform and application/workflow changes, isolated sandbox validation, CI checks, provider contract tests and controlled promotion with rollback. Platform and AI validate the first end-to-end journey together, then inject failure at persistence, dispatch and provider boundaries. Use synthetic customer data; no cloud deployment or paid model experiment is part of this take-home.
+## 6. Delivery, validation and AI usage
 
-| Scenario to validate before launch | Required evidence |
+### Development and delivery
+
+Use reviewed Terraform with protected, encrypted and locked remote state in a separate regional S3 bucket, plus isolated environment access. CI validates infrastructure, application and workflow changes; promote through sandbox tests with synthetic data and controlled rollout/rollback. Platform and AI build one complete journey early and test failures at persistence and provider boundaries.
+
+**Indicative launch estimate: 6–8 weeks for an agreed first-release scope**, conditional on accounts, provider sandboxes/contracts and parallel AI-team delivery:
+
+- **Weeks 1–2:** confirm region, recovery scope, provider guarantees and operational ownership; establish infrastructure, identity/secrets, CI and baseline telemetry.
+- **Weeks 3–5:** integrate the first durable journey, reconciliation, resume/status, notifications and operator handoff; begin joint failure tests immediately.
+- **Weeks 6–8:** complete readiness checks, tune capacity/cost and rehearse recovery and escalation. Provider limitations, missing product capabilities or failed recovery tests extend the timeline.
+
+After launch, stabilize using incidents, stale journeys, latency and unit costs. Expand capacity from measured pressure and forecast demand; defer additional services until their benefit and ownership are clear.
+
+### Validation priorities
+
+| Area | Evidence required before launch |
 |---|---|
-| Disconnect/restart and days-long waits | Conversation, pending input and journey resume without starting again; accelerated timer tests plus representative soak tests. |
-| Duplicate delivery and concurrent claims | Repeated requests, expired leases and worker crashes do not create duplicate charges or shipments; reconcile against sandbox provider records. |
-| Premature activation | Missing, failed, stale or reordered prerequisite events cannot authorize activation. |
-| Lost callback and uncertain payment | Crash after provider success and before local persistence/callback; reconcile the effect and recover notification without repeating it. |
-| Deployment | An old waiting journey resumes across worker/schema/workflow updates and rollback. |
-| Provider outage/throttling | Bounded retries, backpressure, truthful status, controlled recovery and manual escalation. |
-| Availability and recovery | Inject pod/node/AZ/database failover; measure customer-visible outage, state loss and time to resume against the agreed SLO, RPO and RTO. Rehearse restore separately. |
-| Load and cost | Representative interactive/background mix establishes latency, bottlenecks, queue drain time and sustainable unit cost within provider limits. |
-| Isolation, residency and audit | Cross-customer and unauthorized-operator access is denied; validate secret rotation and redaction, inspect endpoints/egress and storage/telemetry regions, and reconstruct actions even with sampled traces. |
-| Durable acceptance | Two pollers, expired claims and crashes before/after remote acceptance: acknowledged commands remain recoverable without duplicate logical operations. |
-| Uploads and notifications | Interrupted/invalid uploads, replacement after validation, orphan cleanup and retention including old versions; absent customers, duplicate/failed notifications and obsolete reminders. |
-| Terraform operations | Concurrent runs respect locking, environment access is isolated, state recovery is reconciled with real resources in sandbox. |
-| Scaling and operational handoff | Mixed chat/CPU bursts, unavailable metrics, node provisioning/drain and provider saturation respect limits; verify placement, alert ownership, escalation and cost attribution. |
+| Journey continuity | Disconnects, restarts and long waits preserve conversation and pending actions; interrupted responses recover and absent customers receive essential updates. |
+| Safe external actions | Exercise the worked example, concurrent confirmations, duplicate/early/late events, lost callbacks and provider outages. Provider records show no duplicate charge/shipment; unmet prerequisites prevent activation; unresolved cases reach review. |
+| Deployment compatibility | An old waiting journey resumes across workflow, worker and schema updates, including rollback. |
+| Recovery | Inject pod/node/AZ/database failures and measure customer-visible recovery and state loss against the targets. Rehearse backup restore separately. |
+| Security and sustainable load | Demonstrate customer/operator isolation, upload controls, regional data paths, secret protection and auditable actions. Mixed chat/CPU load respects latency, provider limits, capacity and cost expectations; verify alert ownership. |
 
-These are planned tests, not reported results. Unmet correctness, residency or recovery targets are explicit launch blockers, not assumed properties of AWS.
+These are planned tests, not results. Correctness, residency and recovery failures block launch.
 
-### Phase 1 - Launch
+### AI usage
 
-**Indicative estimate: 6–8 weeks**, conditional on accounts, provider sandboxes/contracts and parallel AI-team delivery. It is not a commitment from two Platform Engineers in isolation.
+Codex with **GPT-5.6 Terra** and **GPT-6 Astra** assisted planning, requirements review, comparison of design alternatives, Markdown drafting and failure-scenario preparation. AI work included critical review and consolidation; it did not include a deployment or production validation. Official AWS, Kubernetes, PostgreSQL, HashiCorp and OpenTelemetry documentation informed the discussion.
 
-- **Weeks 1–2 — foundations:** confirm region, SLO/recovery scope, provider guarantees and ownership; establish Terraform, networking, EKS, database, identity/secrets, CI, baseline observability and security. Establish the agreed outbox and version-compatibility contracts with AI Engineers.
-- **Weeks 3–5 — integration:** deliver the first durable journey with AI Engineers, then integrate queues, provider reconciliation, resume/status, essential notifications and manual-review handoff. Start joint end-to-end and fault tests immediately.
-- **Weeks 6–8 — launch readiness:** complete recovery, compatibility, isolation, audit and representative load tests; tune capacity/cost, rehearse runbooks and agree operational coverage. Missing provider capabilities or failed recovery tests extend the timeline or require an explicit scope decision.
+The repository separates instructions, source requirements and the evolving answer so AI suggestions cannot silently become assignment requirements:
 
-### Phase 2 - Stabilize and measure
+```text
+AGENTS.md      AI working rules: scope, review criteria and required distinctions
+assignment.md  Authoritative take-home requirements; not edited during preparation
+solution.md    Working proposal: assumptions, decisions, trade-offs and validation gaps
+```
 
-During the first weeks after launch, review incidents, stale journeys, latency and unit costs jointly. Tune alerts, retry limits, queries and operator procedures using production evidence; timing depends on representative traffic and ownership being available.
+This structure made the review path explicit: re-read the assignment, challenge the current proposal under `AGENTS.md`, then edit only the working solution. It also preserves enough factual notes to explain what was delegated and how the output was checked without requiring a complete chat transcript.
 
-### Phase 3 - Scale when justified by evidence
+I reviewed the design choices and accepted outbox delivery, managed orchestration, explicit recovery assumptions and a resilient launch baseline. I requested a critical review and approved simplifying the document around state ownership, operation identity, reconciliation and one worked example. Auto Mode was not selected; GPUs, Redis and alternative orchestration remain deferred. Detailed SQL, locking and scheduling procedures were removed from the main proposal.
 
-At measured saturation, sustained backlog or forecast demand, expand capacity and request quotas before limits are reached. Introduce caching, GPU serving or a different workflow engine only with a specific bottleneck, validation and ownership case. No fixed calendar milestone or final-scale capacity is assumed.
-
-## 8. AI usage
-
-### Tools / models used
-
-I used Codex for design consolidation, trade-off analysis and Markdown drafting. A previous agent supplied the initial consolidation plan; exact model identifiers were not verified. Official AWS, Kubernetes, PostgreSQL, HashiCorp and OpenTelemetry documentation was checked during the discussion.
-
-### What I delegated
-
-I delegated requirements review, comparison of alternatives, presentation drafting and the five failure-scenario answers. The work produced documentation, not a running implementation. No cloud deployment, provider experiment or paid cloud test was performed.
-
-### Suggestions I accepted or changed
-
-I reviewed the proposal point by point and approved transactional outbox with a polling dispatcher, callback recovery, workflow versioning and compatible workers; Multi-AZ with explicit recovery assumptions; essential notifications; S3 documents and separate Terraform state; HPA and Managed Node Groups with Cluster Autoscaler; security, managed observability and durable audit. I chose a resilient baseline sized for gradual growth rather than initial final-scale capacity.
-
-I did not select Auto Mode for this proposal. Dedicated CPU groups are conditional; GPUs, Redis, Temporal, RLS and VPA remain optional or deferred. Exact budgets, provider guarantees and operational coverage remain unresolved rather than inferred.
-
-### How I reviewed and validated the work
-
-I reviewed and approved each design topic in conversation, then approved consolidation. Documentary validation checks assignment coverage, consistency across the three files, eight solution sections, five discussion questions, presentation timing and change scope. These checks do not establish runtime correctness: the operational tests in section 7 are future launch criteria. No external exactly-once guarantee or automatic achievement of RPO/RTO is claimed.
+Validation of this revision is documentary: assignment coverage, internal consistency, example/architecture alignment and reduced length. Runtime tests remain future launch criteria. No cloud deployment, provider experiment or paid cloud test was performed. The example illustrates the design; it does not demonstrate production guarantees.

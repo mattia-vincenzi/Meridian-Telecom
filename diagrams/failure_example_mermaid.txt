@@ -1,0 +1,58 @@
+sequenceDiagram
+    actor Customer
+    participant API
+    participant DB as PostgreSQL
+    participant Dispatcher
+    participant SF as Step Functions
+    participant SQS
+    participant Worker
+    participant Provider as Payment Provider
+
+    %% 1. Purchase confirmed
+    Customer->>API: Confirm purchase
+    API->>DB: Save purchase + payment operation + outbox
+    DB-->>API: Commit
+    API-->>Customer: Request accepted
+
+    %% 2. Payment workflow starts
+    Dispatcher->>DB: Read outbox
+    Dispatcher->>SF: Start workflow
+    SF->>SQS: Queue payment task
+    SQS->>Worker: Deliver task
+    Worker->>DB: Save payment intent
+    Worker->>Provider: Charge payment (idempotency key)
+    Provider-->>Worker: Payment charged
+
+    %% 3. Crash
+    rect rgba(205, 13, 13, 1)
+        Note over Worker: Crash before saving outcome
+        Note over DB: Status = payment pending / outcome uncertain
+    end
+
+    %% 4. Webhook arrives
+    Provider->>API: Payment successful webhook
+    API->>DB: Authenticate and save webhook
+
+    %% 5. Customer returns
+    Customer->>API: Return to chat
+    API->>DB: Read purchase + status
+    API-->>Customer: Resume same journey
+
+    %% 6. Worker recovers
+    SQS->>Worker: Redeliver task
+    Worker->>DB: Find same payment operation
+
+    alt Webhook already stored
+        DB-->>Worker: Payment already confirmed
+    else Need provider check
+        Worker->>Provider: Check payment status
+        Provider-->>Worker: Payment successful
+    end
+
+    Worker->>DB: Save success + callback outbox
+    Worker-->>SQS: Delete message
+
+    %% 7. Workflow resumes
+    Dispatcher->>DB: Read callback outbox
+    Dispatcher->>SF: Resume workflow
+    SF-->>Customer: Journey continues toward shipment

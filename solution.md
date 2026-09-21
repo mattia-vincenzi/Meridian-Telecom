@@ -217,11 +217,15 @@ Attribute spend by environment/component, set budget alerts and enforce usage/co
 
 Use reviewed Terraform with **remote S3 state shared by the two Platform Engineers**, encryption and locking; isolate access by environment. CI checks infrastructure, application and workflows, with synthetic sandbox tests and controlled rollout/rollback. Platform and AI build one complete journey early and exercise its failure points.
 
-**Indicative launch estimate: 6–8 weeks for an agreed first-release scope**, conditional on accounts, provider sandboxes/contracts and parallel AI-team delivery:
+**Indicative delivery plan: 12 weeks in three phases for an agreed first-release scope**, assuming two dedicated Platform Engineers, parallel AI-team delivery, and available accounts, external provider test environments, credentials and agreed integration contracts. This is a planning estimate, not a validated delivery commitment.
 
-- **Weeks 1–2:** confirm region, recovery scope, provider guarantees and operational ownership; establish infrastructure, identity/secrets, CI and baseline telemetry.
-- **Weeks 3–5:** integrate the first durable journey, reconciliation, resume/status, notifications and operator handoff; begin joint failure tests immediately.
-- **Weeks 6–8:** complete readiness checks, tune capacity/cost and rehearse recovery and escalation. Provider limitations, missing product capabilities or failed recovery tests extend the timeline.
+| Phase | Main activities | Expected outcome |
+|---|---|---|
+| **Weeks 1–2 — Foundations** | Confirm region, recovery scope, provider guarantees and operational ownership. Provision infrastructure with Terraform, access controls, secrets, CI and baseline telemetry. | Environment ready for integration; critical dependencies confirmed. |
+| **Weeks 3–6 — Complete journey** | Integrate the first durable journey with AI Engineers, including reconciliation, resume/status, notifications and manual-review handoff. Start joint failure testing. | End-to-end journey demonstrated in provider test environments, including resume and safe handling of retries and duplicate events. |
+| **Weeks 7–12 — Launch readiness** | Validate load, recovery targets (RPO < 1 minute, RTO < 10 minutes), data residency and deployment compatibility. Fix issues and repeat failed checks; tune capacity/cost. Finalize runbooks, rehearse recovery and escalation, agree incident ownership and roll out gradually after approval. | Correctness, residency and recovery checks passed; initial rollout monitored with rollback procedures ready. |
+
+The final phase includes time for corrections and repeated validation, not just executing tests. Launch remains conditional on passing the readiness checks; missing provider guarantees, scope changes or unresolved failures require revising the plan, even beyond week 12.
 
 After launch, incidents, stalled journeys, latency and unit costs guide priorities and capacity increases.
 
@@ -241,6 +245,7 @@ These are planned tests, not results. Correctness, residency and recovery failur
 
 - **Tools and delegated work:** Codex with GPT-5.6 Terra and GPT-6 Astra for planning, critical review of requirements and alternatives, drafting and consolidation, failure scenarios and cost verification. Planning steps were followed by implementation after critical review and validation of the proposed solution against the requirements.
 - **Reviewed choices:** accepted outbox delivery, managed orchestration, explicit recovery assumptions and a resilient baseline. Auto Mode was not selected; GPUs, Redis and alternative orchestration were deferred. Detailed SQL/locking/scheduling was removed and dense explanations were replaced with a step-by-step payment example.
+- **Roadmap review:** Codex helped clarify delivery dependencies and launch criteria; the author selected a three-phase, 12-week plan with time for fixes, repeated checks and gradual rollout. The English and Italian roadmap text was checked for consistency; the estimate remains unvalidated.
 - **Checks and limitations:** assignment coverage and architecture/example consistency were reviewed with reference to official documentation. AWS Ireland pricing was assessed by distinguishing tariffs and usage assumptions for fixed and variable costs. No deployment, provider experiment or runtime test was performed: operational guarantees remain to be demonstrated.
 
 The repository separates instructions, requirements and the proposal so AI suggestions are not treated as requirements:

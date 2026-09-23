@@ -8,8 +8,7 @@ The proposed architecture combines AWS EKS, RDS PostgreSQL, Step Functions, SQS 
 - [Original assignment](original/Platform_Take_Home_Assignment.pdf) — assignment supplied as a PDF.
 - [Solution](solution.md) — proposed architecture, trade-offs, assumptions, costs, delivery roadmap and AI usage notes.
 - [Presentation deck](presentation/meridian_mattia_vincenzi.pptx) — PowerPoint material for the technical discussion.
-- [Architecture diagram](img/architecture.png) — platform architecture image.
-- [Network diagram](img/schema_rete.png) — network layout image.
+- [Architecture diagram](img/architecture_last.png) — platform architecture image.
+- [Network diagram](img/net_schema.png) — network layout image.
 - [Failure example](diagrams/failure_example_mermaid.txt) — Mermaid source for the payment recovery sequence.
 - [AI working instructions](AGENTS.md) — repository guidelines for AI-assisted preparation.
-- [Ignore rules](.gitignore) — files excluded from version control.
